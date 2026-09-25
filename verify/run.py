@@ -10,7 +10,12 @@
          last support is retracted;
        - idempotent replay, rejection of unknown facts / dangling premises /
          self-supporting loops, and inert cyclic rules;
-  4. exit 0 when everything passed, 1 otherwise.
+  4. shared-premise basis scenarios: a 15-layer procedure whose support DAG
+     expands exponentially as a tree must still answer the full-basis query
+     compactly (each node once, premises referenced by id), express cycles
+     finitely, keep valid/invalid semantics, and never block concurrent
+     procedure mutations while a large basis is being constructed;
+  5. exit 0 when everything passed, 1 otherwise.
 """
 
 from __future__ import annotations
@@ -19,6 +24,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -168,11 +174,15 @@ def step_smoke() -> bool:
                 len(remaining) == 1 and remaining[0]["rule_id"] == "R2"
                 and remaining[0]["premises"] == ["F2"],
                 json.dumps(remaining, ensure_ascii=False))
-    _, tree, _ = http("GET", "/api/conclusions/C/justification", expect=200)
-    live = [s for s in tree["supports"] if s["status"] == "valid"]
+    _, basis, _ = http("GET", "/api/conclusions/C/justification", expect=200)
+    live = [s for s in basis["nodes"]["C"]["supports"]
+            if s["status"] == "valid"]
     ok &= check("justification endpoint shows only R2 as live support",
-                len(live) == 1 and live[0]["rule_id"] == "R2"
-                and live[0]["premises"][0]["node"] == "F2")
+                basis["root"] == "C" and len(live) == 1
+                and live[0]["rule_id"] == "R2"
+                and live[0]["premises"] == ["F2"]
+                and basis["nodes"]["F2"]["kind"] == "fact"
+                and basis["nodes"]["F2"]["valid"])
 
     # -- retract the last support: C and the dependent D must fall
     _, verdict2, _ = http("POST", "/api/facts/F2/retract", expect=200)
@@ -231,6 +241,137 @@ def step_smoke() -> bool:
     return ok
 
 
+def step_shared_basis() -> bool:
+    """Acceptance scenarios for the shared-support basis graph.
+
+    Builds F plus 15 layers of conclusions with two single-premise rules
+    per layer (both sharing the previous layer's conclusion): 16 business
+    nodes, 30 rules — a support DAG whose naive tree expansion would be
+    exponential.  The full basis of C14 must stay compact, keep every
+    support relation recomputable, express cycles finitely, and its
+    construction must not block concurrent procedure mutations.
+    """
+    ok = True
+
+    try:
+        http("POST", "/api/reset", {}, expect=200)
+        http("POST", "/api/facts", {"id": "F", "label": "root"}, expect=201)
+        rules = []
+        for i in range(15):
+            prev = "F" if i == 0 else f"C{i - 1}"
+            rules.append({"id": f"R{i}a", "premises": [prev],
+                          "conclusion": f"C{i}"})
+            rules.append({"id": f"R{i}b", "premises": [prev],
+                          "conclusion": f"C{i}"})
+        http("POST", "/api/rules", rules, expect=201)
+    except AssertionError as exc:
+        return check("shared-premise procedure established", False, str(exc))
+
+    # -- the complete basis stays compact and shares common premises
+    _, basis, raw = http("GET", "/api/conclusions/C14/justification",
+                         expect=200)
+    ok &= check("shared-premise basis fits in 1 MiB",
+                len(raw) <= 1024 * 1024, f"bytes={len(raw)}")
+    nodes = basis.get("nodes", {})
+    expected = {"F"} | {f"C{i}" for i in range(15)}
+    ok &= check("basis carries each of the 16 nodes exactly once",
+                basis.get("root") == "C14" and set(nodes) == expected,
+                f"nodes={len(nodes)}")
+    # Callers can recompute the support relation from the response: every
+    # premise reference resolves to the single shared node entry, and the
+    # 30 rule firings are all present.
+    recomputable = all(
+        premise in nodes
+        for entry in nodes.values() if entry["kind"] == "conclusion"
+        for support in entry["supports"] for premise in support["premises"]
+    )
+    firings = sum(len(entry["supports"]) for entry in nodes.values()
+                  if entry["kind"] == "conclusion")
+    refs_c13 = sum(
+        1 for entry in nodes.values() if entry["kind"] == "conclusion"
+        for support in entry["supports"] if support["premises"] == ["C13"]
+    )
+    ok &= check("support relation recomputable; C13 shared, not duplicated",
+                recomputable and firings == 30 and refs_c13 == 2
+                and nodes.get("C13", {}).get("valid") is True,
+                f"firings={firings} refs_to_C13={refs_c13}")
+
+    # -- validity semantics survive the graph encoding
+    http("POST", "/api/facts/F/retract", expect=200)
+    _, basis, _ = http("GET", "/api/conclusions/C14/justification",
+                       expect=200)
+    nodes = basis["nodes"]
+    ok &= check("after retracting F: full basis kept, every node invalid",
+                len(nodes) == 16
+                and all(not n["valid"] for n in nodes.values())
+                and all(s["status"] == "invalid" for n in nodes.values()
+                        for s in n.get("supports", [])))
+    http("POST", "/api/facts/F/assert", expect=200)
+    _, basis, _ = http("GET", "/api/conclusions/C14/justification",
+                       expect=200)
+    ok &= check("after re-asserting F: every node valid again",
+                all(n["valid"] for n in basis["nodes"].values()))
+
+    # -- cyclic support: finite response, loop fully expressed
+    http("POST", "/api/rules", [
+        {"id": "RCX", "premises": ["CY"], "conclusion": "CX"},
+        {"id": "RCY", "premises": ["CX"], "conclusion": "CY"},
+    ], expect=201)
+    _, basis, raw = http("GET", "/api/conclusions/CX/justification",
+                         expect=200)
+    nodes = basis.get("nodes", {})
+    cx_premises = [p for s in nodes.get("CX", {}).get("supports", [])
+                   for p in s["premises"]]
+    cy_premises = [p for s in nodes.get("CY", {}).get("supports", [])
+                   for p in s["premises"]]
+    ok &= check("cyclic basis is finite, complete and keeps the loop",
+                set(nodes) == {"CX", "CY"}
+                and nodes["CX"]["cyclic"] and nodes["CY"]["cyclic"]
+                and not nodes["CX"]["valid"] and not nodes["CY"]["valid"]
+                and cx_premises == ["CY"] and cy_premises == ["CX"]
+                and len(raw) <= 1024 * 1024,
+                f"nodes={sorted(nodes)} bytes={len(raw)}")
+
+    # -- concurrent basis queries must not block procedure mutations
+    stop_hammer = threading.Event()
+
+    def hammer():
+        while not stop_hammer.is_set():
+            try:
+                http("GET", "/api/conclusions/C14/justification", expect=200)
+            except Exception:  # noqa: BLE001 - keep hammering until told
+                pass
+
+    workers = [threading.Thread(target=hammer, daemon=True)
+               for _ in range(4)]
+    for worker in workers:
+        worker.start()
+    started = time.time()
+    mutations_ok = True
+    try:
+        http("POST", "/api/facts", {"id": "FCONC"}, expect=201)
+        http("POST", "/api/rules",
+             {"id": "RCONC", "premises": ["FCONC"], "conclusion": "CCONC"},
+             expect=201)
+        http("POST", "/api/facts/FCONC/retract", expect=200)
+        http("POST", "/api/facts/FCONC/assert", expect=200)
+    except AssertionError:
+        mutations_ok = False
+    elapsed = time.time() - started
+    stop_hammer.set()
+    for worker in workers:
+        worker.join()
+    ok &= check("mutations not blocked by concurrent basis queries",
+                mutations_ok and elapsed < 5.0, f"elapsed={elapsed:.2f}s")
+    _, state, _ = http("GET", "/api/state", expect=200)
+    conclusions = {c["id"]: c for c in state["conclusions"]}
+    ok &= check("procedure consistent after the concurrent burst",
+                conclusions.get("CCONC", {}).get("valid") is True
+                and conclusions.get("C14", {}).get("valid") is True)
+
+    return ok
+
+
 def main() -> int:
     print(f"verify: target={APP_BASE_URL} page_out={PAGE_OUT} "
           f"stamp={STAMP}", flush=True)
@@ -238,6 +379,7 @@ def main() -> int:
     ok = step_build_page() and ok
     try:
         ok = step_smoke() and ok
+        ok = step_shared_basis() and ok
     except Exception as exc:  # noqa: BLE001 - report any smoke failure
         report("smoke run aborted", False, repr(exc))
         ok = False

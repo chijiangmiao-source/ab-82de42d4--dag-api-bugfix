@@ -251,6 +251,13 @@ class Store:
             "SELECT * FROM supports WHERE rule_id = ?", (rule_id,)
         ).fetchone()
 
+    def list_supports(self) -> list:
+        """Every stored support, in one query (snapshot for basis graphs)."""
+        rows = self.conn.execute(
+            "SELECT * FROM supports ORDER BY rule_id"
+        ).fetchall()
+        return [self._support_dict(r) for r in rows]
+
     def supports_for_conclusion(self, conclusion: str) -> list:
         rows = self.conn.execute(
             "SELECT * FROM supports WHERE conclusion = ? ORDER BY rule_id",

@@ -13,6 +13,7 @@ same persistent transaction as the fact status flip.
 from __future__ import annotations
 
 import re
+from collections import deque
 
 from .store import Store, utcnow
 
@@ -252,12 +253,30 @@ class Engine:
             }
 
     def justification(self, node) -> dict:
-        """Complete current basis of a node, recursively expanded."""
+        """Complete current basis of `node` as a shared support graph.
+
+        Returns ``{"root": node, "nodes": {...}}`` where every node
+        reachable from the root through the support relation appears
+        exactly once.  Each support references its premises by node id,
+        so a premise shared by many rules is transmitted a single time
+        instead of being copied into every referring subtree, and cyclic
+        support is expressed by those references (flagged via ``cyclic``)
+        rather than by infinite expansion.  Callers can therefore
+        recompute the full support relation — sharing included — from the
+        response alone.
+
+        The graph is assembled outside the store lock from a consistent
+        point-in-time snapshot, so constructing or serialising a large
+        basis never blocks concurrent procedure mutations.
+        """
         node = _check_id("node", node)
         with self.store.lock:
             if self.store.node_kind(node) is None:
                 raise NotFound(f"unknown node {node!r}")
-            return self._justify(node, path=())
+            facts = self.store.list_facts()
+            conclusions = self.store.list_conclusions()
+            supports = self.store.list_supports()
+        return self._build_justification(node, facts, conclusions, supports)
 
     def health(self) -> dict:
         return {"status": "ok" if self.store.ping() else "degraded"}
@@ -434,24 +453,122 @@ class Engine:
             depth += 1
         return chain
 
-    def _justify(self, node, path) -> dict:
-        kind = self.store.node_kind(node)
-        if kind == "fact":
-            fact = self.store.get_fact(node)
-            return {"node": node, "kind": "fact", "label": fact["label"],
+    # -------------------------------------------------------- justifications
+
+    @classmethod
+    def _build_justification(cls, root, facts, conclusions, supports) -> dict:
+        """Assemble the shared support graph of `root` from a snapshot."""
+        fact_rows = {row["id"]: row for row in facts}
+        validity = {row["id"]: row["valid"] for row in conclusions}
+        by_conclusion = {}
+        for support in supports:
+            by_conclusion.setdefault(support["conclusion"], []).append(support)
+
+        # Every node reachable from the root, visited once.  Iterative
+        # breadth-first so deep procedures cannot hit the recursion limit.
+        order = []
+        seen = {root}
+        queue = deque([root])
+        while queue:
+            current = queue.popleft()
+            order.append(current)
+            for support in by_conclusion.get(current, ()):
+                for premise in support["premises"]:
+                    if premise not in seen:
+                        seen.add(premise)
+                        queue.append(premise)
+
+        cyclic = cls._cyclic_nodes(seen, by_conclusion)
+
+        nodes = {}
+        for node_id in order:
+            fact = fact_rows.get(node_id)
+            if fact is not None:
+                nodes[node_id] = {
+                    "node": node_id,
+                    "kind": "fact",
+                    "label": fact["label"],
                     "status": fact["status"],
-                    "valid": fact["status"] == "asserted"}
-        if node in path:
-            return {"node": node, "kind": "conclusion", "cyclic": True,
-                    "valid": self.store.node_valid(node)}
-        supports = []
-        for support in self.store.supports_for_conclusion(node):
-            supports.append({
-                "rule_id": support["rule_id"],
-                "status": support["status"],
-                "premises": [self._justify(p, path + (node,))
-                             for p in support["premises"]],
-            })
-        return {"node": node, "kind": "conclusion",
-                "valid": self.store.node_valid(node),
-                "supports": supports}
+                    "valid": fact["status"] == "asserted",
+                }
+            else:
+                nodes[node_id] = {
+                    "node": node_id,
+                    "kind": "conclusion",
+                    "valid": validity.get(node_id, False),
+                    "cyclic": node_id in cyclic,
+                    "supports": [
+                        {
+                            "rule_id": support["rule_id"],
+                            "status": support["status"],
+                            "premises": list(support["premises"]),
+                        }
+                        for support in by_conclusion.get(node_id, ())
+                    ],
+                }
+        return {"root": root, "nodes": nodes}
+
+    @staticmethod
+    def _cyclic_nodes(reachable, by_conclusion) -> set:
+        """Subset of `reachable` that lies on a support cycle.
+
+        Tarjan's strongly-connected-components, iterative so deep support
+        chains cannot hit the recursion limit.  A node is cyclic when its
+        SCC has more than one member or it directly supports itself.
+        """
+        edges = {}
+        for node in reachable:
+            targets = []
+            for support in by_conclusion.get(node, ()):
+                targets.extend(
+                    p for p in support["premises"] if p in reachable
+                )
+            edges[node] = targets
+
+        index = {}
+        lowlink = {}
+        on_stack = set()
+        stack = []
+        cyclic = set()
+        next_index = 0
+
+        for start in edges:
+            if start in index:
+                continue
+            work = [(start, 0)]
+            while work:
+                node, child_pos = work[-1]
+                if child_pos == 0:
+                    index[node] = lowlink[node] = next_index
+                    next_index += 1
+                    stack.append(node)
+                    on_stack.add(node)
+                descended = False
+                children = edges[node]
+                while child_pos < len(children):
+                    child = children[child_pos]
+                    child_pos += 1
+                    if child not in index:
+                        work[-1] = (node, child_pos)
+                        work.append((child, 0))
+                        descended = True
+                        break
+                    if child in on_stack:
+                        lowlink[node] = min(lowlink[node], index[child])
+                if descended:
+                    continue
+                work.pop()
+                if lowlink[node] == index[node]:
+                    scc = []
+                    while True:
+                        member = stack.pop()
+                        on_stack.discard(member)
+                        scc.append(member)
+                        if member == node:
+                            break
+                    if len(scc) > 1 or node in edges[node]:
+                        cyclic.update(scc)
+                if work:
+                    parent = work[-1][0]
+                    lowlink[parent] = min(lowlink[parent], lowlink[node])
+        return cyclic

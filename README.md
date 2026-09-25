@@ -30,7 +30,13 @@
 | POST | `/api/rules` | 添加单条规则或 JSON 数组批量原子添加 |
 | POST | `/api/facts/{id}/retract` | 撤回事实,返回裁决(失效结论、剩余依据、传播链) |
 | POST | `/api/facts/{id}/assert` | 恢复事实 |
-| GET | `/api/conclusions/{id}/justification` | 结论的完整递归依据树 |
+| GET | `/api/conclusions/{id}/justification` | 结论的完整依据（共享支持图，见下） |
+
+依据查询返回 `{"root": id, "nodes": {...}}`：从根节点沿支持关系可达的
+每个节点只出现一次，规则支持以节点标识引用前提。被多条规则共享的前提
+因此只传输一次（不会复制成彼此独立的子树），循环支持由引用本身表达
+（节点带 `cyclic` 标记），调用方可据节点与关系复算完整支持结构。图在
+锁外由一致性快照组装，大型依据的构造不会阻塞并发的规程变更。
 | POST | `/api/reset` | 清空规程(仅 `TMS_ALLOW_RESET=1` 时可用) |
 
 ## 本地运行
