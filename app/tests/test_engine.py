@@ -1,10 +1,15 @@
 """Rule-logic (JTMS) test suite — runs with the plain stdlib unittest."""
 
+import json
 import os
 import tempfile
+import threading
 import unittest
 
 from app.tms import Conflict, Engine, NotFound, ValidationFailed
+
+
+ONE_MIB = 1024 * 1024
 
 
 class EngineCase(unittest.TestCase):
@@ -165,22 +170,164 @@ class EngineCase(unittest.TestCase):
         self.assert_valid("D")
         self.assertEqual(verdict["restored"], ["C", "D"])
 
-    def test_justification_tree_is_complete(self):
+    def build_shared_chain(self, layers=15):
+        """F, then `layers` conclusions; each layer has two rules whose only
+        premise is the previous layer's conclusion (shared premise)."""
+        self.engine.add_fact("F")
+        prev = "F"
+        for i in range(layers):
+            conclusion = f"C{i}"
+            self.engine.add_rules([
+                {"id": f"R{i}a", "premises": [prev], "conclusion": conclusion},
+                {"id": f"R{i}b", "premises": [prev], "conclusion": conclusion},
+            ])
+            prev = conclusion
+        return prev
+
+    def assert_snapshot_consistent(self, graph):
+        """Every valid support's premises are valid nodes in the same graph."""
+        nodes, supports = graph["nodes"], graph["supports"]
+        for support in supports.values():
+            for premise in support["premises"]:
+                self.assertIn(premise, nodes)
+            if support["status"] == "valid":
+                for premise in support["premises"]:
+                    self.assertTrue(
+                        nodes[premise]["valid"],
+                        f"{support['rule_id']} valid but premise {premise} not",
+                    )
+
+    def test_justification_graph_is_complete_and_recomputable(self):
         self.build_two_path_procedure()
         self.engine.retract_fact("F1")
-        tree = self.engine.justification("D")
-        self.assertTrue(tree["valid"])
-        self.assertEqual(tree["supports"][0]["rule_id"], "R3")
-        premise_c = tree["supports"][0]["premises"][0]
-        self.assertEqual(premise_c["node"], "C")
-        valid_supports = [s for s in premise_c["supports"]
-                          if s["status"] == "valid"]
-        self.assertEqual(len(valid_supports), 1)
-        self.assertEqual(valid_supports[0]["rule_id"], "R2")
-        leaf = valid_supports[0]["premises"][0]
-        self.assertEqual(leaf, {"node": "F2", "kind": "fact",
-                                "label": "sensor B reading",
-                                "status": "asserted", "valid": True})
+        graph = self.engine.justification("D")
+        self.assertEqual(graph["format"], "shared-graph/v1")
+        self.assertEqual(graph["root"], "D")
+        nodes, supports = graph["nodes"], graph["supports"]
+
+        self.assertTrue(nodes["D"]["valid"])
+        self.assertEqual(nodes["D"]["support_ids"], ["R3"])
+        self.assertEqual(supports["R3"]["premises"], ["C"])
+        self.assertEqual(supports["R3"]["status"], "valid")
+
+        self.assertTrue(nodes["C"]["valid"])
+        self.assertEqual(nodes["C"]["support_ids"], ["R1", "R2"])
+        # F1 retracted: R1 broken, R2 remains the single live support.
+        self.assertEqual(supports["R1"]["status"], "invalid")
+        self.assertEqual(supports["R2"]["status"], "valid")
+        self.assertEqual(supports["R2"]["premises"], ["F2"])
+        self.assertEqual(nodes["F1"]["status"], "retracted")
+        self.assertEqual(nodes["F2"], {
+            "id": "F2", "kind": "fact", "label": "sensor B reading",
+            "status": "asserted", "valid": True})
+
+        self.assertFalse(any(n.get("cyclic") for n in nodes.values()))
+        self.assertEqual(graph["cycles"], [])
+        self.assert_snapshot_consistent(graph)
+
+    def test_shared_premises_serialised_once_and_response_under_one_mib(self):
+        last = self.build_shared_chain()
+        graph = self.engine.justification(last)
+        encoded = json.dumps(graph, ensure_ascii=False).encode("utf-8")
+        self.assertLess(len(encoded), ONE_MIB)
+
+        # 16 business nodes (1 fact + 15 conclusions), 30 supports.
+        self.assertEqual(set(graph["nodes"]),
+                         {"F"} | {f"C{i}" for i in range(15)})
+        self.assertEqual(len(graph["nodes"]), 16)
+        self.assertEqual(set(graph["supports"]),
+                         {f"R{i}{v}" for i in range(15) for v in "ab"})
+        self.assertEqual(len(graph["supports"]), 30)
+
+        # The shared premise C0 is one node referenced by both layer-1 rules.
+        self.assertEqual(graph["supports"]["R1a"]["premises"], ["C0"])
+        self.assertEqual(graph["supports"]["R1b"]["premises"], ["C0"])
+
+        # A caller rebuilds the whole support structure from id references;
+        # the same premise never appears as two distinct nodes.
+        deps = {}
+        for support in graph["supports"].values():
+            deps.setdefault(support["conclusion"], set()).update(
+                support["premises"])
+        self.assertEqual(deps["C1"], {"C0"})
+        self.assertEqual(deps[last], {"C13"})
+        self.assert_snapshot_consistent(graph)
+
+    def test_justification_represents_cycle_fully_without_expansion(self):
+        self.engine.add_fact("F1")
+        self.engine.add_rules({"id": "R0", "premises": ["F1"],
+                               "conclusion": "X"})
+        self.engine.add_rules([
+            {"id": "R1", "premises": ["X"], "conclusion": "Y"},
+            {"id": "R2", "premises": ["Y"], "conclusion": "X"},
+        ])
+        graph = self.engine.justification("X")
+        self.assertTrue(graph["nodes"]["X"]["valid"])
+        self.assertTrue(graph["nodes"]["X"]["cyclic"])
+        self.assertTrue(graph["nodes"]["Y"]["cyclic"])
+        cycle_edges = {(c["node"], c["rule_id"], c["premise"])
+                       for c in graph["cycles"]}
+        self.assertEqual(cycle_edges,
+                         {("X", "R2", "Y"), ("Y", "R1", "X")})
+        # Complete: all three supports (incl. the ground path) present once.
+        self.assertEqual(set(graph["supports"]), {"R0", "R1", "R2"})
+        self.assertLess(len(json.dumps(graph).encode()), ONE_MIB)
+
+        # Ground retraction collapses the loop but keeps the cycle relations.
+        self.engine.retract_fact("F1")
+        graph2 = self.engine.justification("X")
+        self.assertFalse(graph2["nodes"]["X"]["valid"])
+        self.assertFalse(graph2["nodes"]["Y"]["valid"])
+        self.assertEqual(graph2["supports"]["R0"]["status"], "invalid")
+        self.assertEqual({(c["node"], c["rule_id"]) for c in graph2["cycles"]},
+                         {("X", "R2"), ("Y", "R1")})
+        self.assert_snapshot_consistent(graph2)
+
+    def test_justification_queries_do_not_block_concurrent_mutations(self):
+        # A long chain keeps graph construction busy without holding the
+        # store lock; mutations must commit while queries are in flight.
+        self.build_shared_chain(layers=120)
+        stop = threading.Event()
+        errors = []
+
+        def query_loop():
+            try:
+                while not stop.is_set():
+                    self.engine.justification("C119")
+            except Exception as exc:  # pragma: no cover - diagnostic
+                errors.append(exc)
+
+        workers = [threading.Thread(target=query_loop) for _ in range(3)]
+        for worker in workers:
+            worker.start()
+        try:
+            # Each mutation must commit promptly even while large justification
+            # graphs are being assembled.
+            for number in range(5):
+                ready = threading.Event()
+
+                def add_one(n=number):
+                    ready.set()
+                    self.engine.add_fact(f"G{n}")
+
+                op = threading.Thread(target=add_one)
+                op.start()
+                self.assertTrue(ready.wait(2))
+                op.join(timeout=5)
+                self.assertFalse(op.is_alive(), "mutation blocked by query")
+
+            verdict = self.engine.retract_fact("F")
+            self.assertIn("C0",
+                          [item["node"] for item in verdict["invalidated"]])
+            restored = self.engine.assert_fact("F")
+            self.assertIn("C0", restored["restored"])
+        finally:
+            stop.set()
+            for worker in workers:
+                worker.join(timeout=5)
+                self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assert_snapshot_consistent(self.engine.justification("C119"))
 
     def test_justification_of_unknown_node_rejected(self):
         with self.assertRaises(NotFound):
@@ -213,10 +360,10 @@ class EngineCase(unittest.TestCase):
             self.assertTrue(conclusions["C"]["valid"])
             self.assertTrue(conclusions["D"]["valid"])
             # Justification state survives the restart as well.
-            tree = reopened.justification("C")
-            valid_supports = [s for s in tree["supports"]
-                              if s["status"] == "valid"]
-            self.assertEqual([s["rule_id"] for s in valid_supports], ["R2"])
+            graph = reopened.justification("C")
+            live = [rule_id for rule_id, support in graph["supports"].items()
+                    if support["status"] == "valid"]
+            self.assertEqual(live, ["R2"])
             # And the recorded verdict is replayed identically.
             replay = reopened.retract_fact("F1")
             self.assertTrue(replay["replayed"])

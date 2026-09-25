@@ -130,32 +130,79 @@ function renderConclusions(state) {
   }
 }
 
-/* 递归渲染一条结论的完整可复算依据树 */
-function renderBasisTree(node) {
-  if (node.kind === "fact") {
-    const cls = node.status === "asserted" ? "fact-leaf asserted"
-                                          : "fact-leaf retracted";
-    const tag = node.status === "asserted" ? "事实·有效" : "事实·已撤回";
-    return `<li><span class="${cls} mono">${esc(node.node)}</span>
-      <span class="hint">(${tag}${node.label ? "·" + esc(node.label) : ""})</span></li>`;
+/* 渲染完整依据:节点与依据各只序列化一次,共享前提以可跳转引用(↪)表示,
+   循环回到当前展开路径上的节点以 ↩ 标记,不再无限或重复展开。 */
+function renderBasisGraph(graph) {
+  const nodes = graph.nodes;
+  const supports = graph.supports;
+  const seen = new Set();
+
+  function refChip(id, cyclic) {
+    const cls = "node-ref mono" + (cyclic ? " cyclic-ref" : "");
+    const arrow = cyclic ? "↩" : "↪";
+    const hint = cyclic ? "循环回到已展开节点" : "共享前提·复用同一节点";
+    return `<li><a class="${cls}" href="#basis-node-${esc(id)}">${arrow} ${esc(id)}</a>
+      <span class="hint">(${hint})</span></li>`;
   }
-  if (node.cyclic) {
-    return `<li><span class="mono">${esc(node.node)}</span>
-      <span class="badge badge-warn">循环支持,不计入依据</span></li>`;
+
+  function nodeBadges(node) {
+    if (node.kind === "fact") {
+      return node.status === "asserted"
+        ? '<span class="badge badge-ok">事实·有效</span>'
+        : '<span class="badge badge-bad">事实·已撤回</span>';
+    }
+    const badges = [node.valid
+      ? '<span class="badge badge-ok">有效</span>'
+      : '<span class="badge badge-bad">已失效</span>'];
+    if (node.cyclic) badges.push('<span class="badge badge-warn">处于循环支持</span>');
+    return badges.join(" ");
   }
-  const items = node.supports.map((s) => {
-    const children = s.premises.map(renderBasisTree).join("");
-    const mark = s.status === "valid"
-      ? '<span class="badge badge-ok">完整支持</span>'
-      : '<span class="badge badge-bad">支持已破</span>';
-    return `<li><span class="mono">${esc(s.rule_id)}</span> ${mark}
-      <ul class="basis-tree">${children}</ul></li>`;
-  }).join("");
-  const badge = node.valid
-    ? '<span class="badge badge-ok">有效</span>'
-    : '<span class="badge badge-bad">已失效</span>';
-  return `<li><span class="mono">${esc(node.node)}</span> ${badge}
-    <ul class="basis-tree">${items}</ul></li>`;
+
+  function renderNode(id, ancestors) {
+    const node = nodes[id];
+    if (ancestors.has(id)) return refChip(id, true);
+    const shared = seen.has(id);
+    seen.add(id);
+
+    if (node.kind === "fact") {
+      const cls = node.status === "asserted"
+        ? "fact-leaf asserted" : "fact-leaf retracted";
+      return `<li id="basis-node-${esc(id)}">
+        <span class="${cls} mono">${esc(id)}</span> ${nodeBadges(node)}
+        ${node.label ? `<span class="hint">(${esc(node.label)})</span>` : ""}
+      </li>`;
+    }
+
+    const next = new Set(ancestors);
+    next.add(id);
+    const supportHtml = (node.support_ids || []).map((sid) => {
+      const s = supports[sid];
+      const mark = s.status === "valid"
+        ? '<span class="badge badge-ok">完整支持</span>'
+        : '<span class="badge badge-bad">支持已破</span>';
+      const cyclicMark = s.cyclic
+        ? ' <span class="badge badge-warn">含循环前提</span>' : "";
+      const premiseHtml = s.premises.map((pid) => {
+        if (next.has(pid)) return refChip(pid, true);
+        if (seen.has(pid)) return refChip(pid, false);
+        return renderNode(pid, next);
+      }).join("");
+      return `<li><span class="mono">${esc(sid)}</span> ${mark}${cyclicMark}
+        <ul class="basis-tree">${premiseHtml}</ul></li>`;
+    }).join("");
+
+    return `<li id="basis-node-${esc(id)}">
+      <span class="mono">${esc(id)}</span> ${nodeBadges(node)}
+      ${shared ? '<span class="hint">(共享节点)</span>' : ""}
+      <ul class="basis-tree">${supportHtml || '<li class="hint">无支持</li>'}</ul>
+    </li>`;
+  }
+
+  const cycleCount = (graph.cycles || []).length;
+  const summary = `<p class="hint">完整依据图:节点 ${Object.keys(nodes).length} 个、`
+    + `依据 ${Object.keys(supports).length} 条${cycleCount ? `、循环边 ${cycleCount} 条` : ""}
+    —— 共享前提以 ↪ 引用同一节点,不重复复制子树。</p>`;
+  return `${summary}<ul class="basis-tree">${renderNode(graph.root, new Set())}</ul>`;
 }
 
 /* ------------------------------------------------------------- 裁决渲染 */
@@ -243,9 +290,9 @@ document.addEventListener("click", async (event) => {
     const box = target.closest(".conclusion").querySelector(".basis");
     if (box.hidden) {
       try {
-        const tree = await api(
+        const graph = await api(
           `/api/conclusions/${encodeURIComponent(target.dataset.basis)}/justification`);
-        box.innerHTML = `<ul class="basis-tree">${renderBasisTree(tree)}</ul>`;
+        box.innerHTML = renderBasisGraph(graph);
         box.hidden = false;
         target.textContent = "收起依据";
       } catch (e) { toast(`查询依据失败:${e.message}`, true); }

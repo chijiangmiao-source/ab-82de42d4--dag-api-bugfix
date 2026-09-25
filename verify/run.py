@@ -19,6 +19,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -169,10 +170,18 @@ def step_smoke() -> bool:
                 and remaining[0]["premises"] == ["F2"],
                 json.dumps(remaining, ensure_ascii=False))
     _, tree, _ = http("GET", "/api/conclusions/C/justification", expect=200)
-    live = [s for s in tree["supports"] if s["status"] == "valid"]
+    live = [rule_id for rule_id, support in tree["supports"].items()
+            if support["status"] == "valid"]
     ok &= check("justification endpoint shows only R2 as live support",
-                len(live) == 1 and live[0]["rule_id"] == "R2"
-                and live[0]["premises"][0]["node"] == "F2")
+                len(live) == 1 and live[0] == "R2"
+                and tree["supports"]["R2"]["premises"] == ["F2"]
+                and tree["nodes"]["F2"]["id"] == "F2")
+    ok &= check("justification is a shared reference graph",
+                tree["format"] == "shared-graph/v1"
+                and tree["root"] == "C"
+                and all(p in tree["nodes"]
+                        for s in tree["supports"].values()
+                        for p in s["premises"]))
 
     # -- retract the last support: C and the dependent D must fall
     _, verdict2, _ = http("POST", "/api/facts/F2/retract", expect=200)
@@ -231,6 +240,160 @@ def step_smoke() -> bool:
     return ok
 
 
+def step_justification_graph() -> bool:
+    """Acceptance coverage for the shared, referenceable justification:
+    bounded size with retained relations, recomputable sharing, cycles, and
+    no blocking of concurrent mutations.
+    """
+    ok = True
+    http("POST", "/api/reset", {}, expect=200)
+
+    # -- F + 15 layers, two rules per layer sharing the previous conclusion
+    http("POST", "/api/facts", {"id": "F"}, expect=201)
+    rules, prev = [], "F"
+    for i in range(15):
+        conclusion = f"C{i}"
+        rules.append({"id": f"R{i}a", "premises": [prev],
+                      "conclusion": conclusion})
+        rules.append({"id": f"R{i}b", "premises": [prev],
+                      "conclusion": conclusion})
+        prev = conclusion
+    http("POST", "/api/rules", rules, expect=201)
+
+    _, graph, raw = http("GET", "/api/conclusions/C14/justification",
+                         expect=200)
+    ok &= check("shared-chain justification under 1 MiB",
+                len(raw) < 1024 * 1024, f"{len(raw)} bytes")
+    ok &= check("justification retains all 16 nodes and 30 supports",
+                len(graph["nodes"]) == 16 and len(graph["supports"]) == 30
+                and graph["format"] == "shared-graph/v1"
+                and graph["root"] == "C14",
+                f"nodes={len(graph['nodes'])} supports="
+                f"{len(graph['supports'])}")
+    ok &= check("all support relations present and reference existing nodes",
+                graph["supports"]["R14a"]["premises"] == ["C13"]
+                and graph["supports"]["R14b"]["premises"] == ["C13"]
+                and all(p in graph["nodes"]
+                        for s in graph["supports"].values()
+                        for p in s["premises"]))
+    ok &= check("whole shared chain is valid in the same response",
+                all(node["valid"] for node in graph["nodes"].values()))
+
+    # The caller rebuilds the support graph from node ids: the shared premise
+    # C0 is one node referenced by both rules, never two distinct nodes.
+    deps = {}
+    for support in graph["supports"].values():
+        deps.setdefault(support["conclusion"], set()).update(
+            support["premises"])
+    ok &= check("shared premise recomputes as one referenced node",
+                deps["C1"] == {"C0"}
+                and graph["supports"]["R1a"]["premises"] == ["C0"]
+                and graph["supports"]["R1b"]["premises"] == ["C0"])
+
+    # -- cyclic support: complete, explicitly represented, never expanded
+    http("POST", "/api/facts", {"id": "G"}, expect=201)
+    http("POST", "/api/rules",
+         {"id": "S0", "premises": ["G"], "conclusion": "X"}, expect=201)
+    http("POST", "/api/rules", [
+        {"id": "S1", "premises": ["X"], "conclusion": "Y"},
+        {"id": "S2", "premises": ["Y"], "conclusion": "X"},
+    ], expect=201)
+    _, cyclic, cyclic_raw = http("GET", "/api/conclusions/Y/justification",
+                                 expect=200)
+    edges = {(c["node"], c["rule_id"], c["premise"])
+             for c in cyclic["cycles"]}
+    ok &= check("cycle query bounded and marks the loop on both edges",
+                len(cyclic_raw) < 1024 * 1024
+                and cyclic["nodes"]["X"]["cyclic"]
+                and cyclic["nodes"]["Y"]["cyclic"]
+                and edges == {("X", "S2", "Y"), ("Y", "S1", "X")},
+                json.dumps(cyclic["cycles"], ensure_ascii=False))
+    ok &= check("cycle response keeps the grounded support relation",
+                set(cyclic["supports"]) == {"S0", "S1", "S2"})
+
+    http("POST", "/api/facts/G/retract", expect=200)
+    _, collapsed, _ = http("GET", "/api/conclusions/X/justification",
+                           expect=200)
+    ok &= check("after ground retraction loop invalid but relations retained",
+                not collapsed["nodes"]["X"]["valid"]
+                and not collapsed["nodes"]["Y"]["valid"]
+                and collapsed["nodes"]["G"]["status"] == "retracted"
+                and len(collapsed["cycles"]) == 2)
+    http("POST", "/api/facts/G/assert", expect=200)
+
+    # -- concurrent justification traffic must not block mutations
+    http("POST", "/api/reset", {}, expect=200)
+    http("POST", "/api/facts", {"id": "F"}, expect=201)
+    deep, prev = [], "F"
+    for i in range(80):
+        conclusion = f"D{i}"
+        deep += [
+            {"id": f"T{i}a", "premises": [prev], "conclusion": conclusion},
+            {"id": f"T{i}b", "premises": [prev], "conclusion": conclusion},
+        ]
+        prev = conclusion
+    http("POST", "/api/rules", deep, expect=201)
+
+    stop = threading.Event()
+    failures = []
+
+    def query_loop():
+        try:
+            while not stop.is_set():
+                status, payload, _ = http(
+                    "GET", "/api/conclusions/D79/justification")
+                if status != 200 or payload["root"] != "D79":
+                    failures.append(f"status={status}")
+        except Exception as exc:  # pragma: no cover - diagnostic
+            failures.append(repr(exc))
+
+    workers = [threading.Thread(target=query_loop) for _ in range(4)]
+    for worker in workers:
+        worker.start()
+    time.sleep(0.3)
+    latencies = {}
+
+    def timed(name, method, path, body=None, expected=200):
+        start = time.monotonic()
+        http(method, path, body, expect=expected)
+        latencies[name] = time.monotonic() - start
+
+    try:
+        timed("retract", "POST", "/api/facts/F/retract")
+        _, down, _ = http("GET", "/api/conclusions/D79/justification",
+                          expect=200)
+        ok &= check("query during churn shows invalidated chain",
+                    not down["nodes"]["D0"]["valid"]
+                    and not down["nodes"]["D79"]["valid"])
+        timed("assert", "POST", "/api/facts/F/assert")
+        timed("add_fact", "POST", "/api/facts", {"id": "EXTRA"},
+              expected=201)
+        timed("add_rule", "POST", "/api/rules",
+              {"id": "TX", "premises": ["EXTRA"], "conclusion": "OUT"},
+              expected=201)
+    finally:
+        stop.set()
+        for worker in workers:
+            worker.join(timeout=5)
+        ok &= check("all concurrent justification queries succeeded",
+                    not failures and not any(w.is_alive() for w in workers),
+                    "; ".join(failures[:3]))
+
+    blocked = {name: f"{dt:.2f}s" for name, dt in latencies.items()
+               if dt > 3.0}
+    ok &= check("mutations not blocked by justification construction",
+                not blocked,
+                "latencies=" + json.dumps(latencies))
+    _, final, _ = http("GET", "/api/conclusions/D79/justification",
+                       expect=200)
+    ok &= check("valid/invalid semantics correct after concurrent churn",
+                final["nodes"]["F"]["valid"]
+                and final["nodes"]["D79"]["valid"]
+                and all(s["status"] == "valid"
+                        for s in final["supports"].values()))
+    return ok
+
+
 def main() -> int:
     print(f"verify: target={APP_BASE_URL} page_out={PAGE_OUT} "
           f"stamp={STAMP}", flush=True)
@@ -238,6 +401,7 @@ def main() -> int:
     ok = step_build_page() and ok
     try:
         ok = step_smoke() and ok
+        ok = step_justification_graph() and ok
     except Exception as exc:  # noqa: BLE001 - report any smoke failure
         report("smoke run aborted", False, repr(exc))
         ok = False

@@ -30,7 +30,7 @@
 | POST | `/api/rules` | 添加单条规则或 JSON 数组批量原子添加 |
 | POST | `/api/facts/{id}/retract` | 撤回事实,返回裁决(失效结论、剩余依据、传播链) |
 | POST | `/api/facts/{id}/assert` | 恢复事实 |
-| GET | `/api/conclusions/{id}/justification` | 结论的完整递归依据树 |
+| GET | `/api/conclusions/{id}/justification` | 结论的完整依据:节点/依据各列一次、按 id 引用的共享图(可表达循环) |
 | POST | `/api/reset` | 清空规程(仅 `TMS_ALLOW_RESET=1` 时可用) |
 
 ## 本地运行

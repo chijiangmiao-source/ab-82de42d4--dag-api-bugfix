@@ -331,6 +331,43 @@ class Store:
                       "rules", "facts", "node_state", "events"):
             self.conn.execute(f"DELETE FROM {table}")
 
+    def snapshot(self) -> dict:
+        """Point-in-time, detached copy of the whole procedure.
+
+        Read in one lock acquisition so the view is internally consistent;
+        callers can then build large answers (e.g. a justification graph)
+        from these plain structures without holding the lock, so query
+        construction never blocks concurrent transactions.
+        """
+        with self.lock:
+            facts = {
+                row["id"]: {
+                    "id": row["id"],
+                    "label": row["label"],
+                    "status": row["status"],
+                }
+                for row in self.list_facts()
+            }
+            supports = {}
+            for row in self.conn.execute(
+                "SELECT * FROM supports ORDER BY rule_id"
+            ).fetchall():
+                supports[row["rule_id"]] = {
+                    "rule_id": row["rule_id"],
+                    "conclusion": row["conclusion"],
+                    "premises": json.loads(row["premises"]),
+                    "status": row["status"],
+                }
+            nodes = {}
+            for row in self.conn.execute(
+                "SELECT node, kind, valid FROM node_state"
+            ).fetchall():
+                nodes[row["node"]] = {
+                    "kind": row["kind"],
+                    "valid": bool(row["valid"]),
+                }
+            return {"facts": facts, "supports": supports, "nodes": nodes}
+
     def ping(self) -> bool:
         try:
             self.conn.execute("SELECT 1").fetchone()

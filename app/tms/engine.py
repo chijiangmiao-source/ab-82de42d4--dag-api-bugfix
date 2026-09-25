@@ -252,12 +252,181 @@ class Engine:
             }
 
     def justification(self, node) -> dict:
-        """Complete current basis of a node, recursively expanded."""
+        """Complete current basis of a node as a shared, referenceable graph.
+
+        Every node and support reachable from `node` is emitted exactly once
+        in flat id-keyed maps; supports reference premises by node id, so a
+        premise shared by many rules is serialised once rather than copied
+        into independent nested subtrees.  Cycles are ordinary graph edges,
+        reported additionally in `cycles` (one entry per edge that closes a
+        loop), so they are represented without infinite expansion.
+
+        Only the point-in-time snapshot is taken under the store lock; the
+        (potentially large) graph is assembled from the detached snapshot,
+        so concurrent transactions are never blocked by query construction.
+        """
         node = _check_id("node", node)
-        with self.store.lock:
-            if self.store.node_kind(node) is None:
-                raise NotFound(f"unknown node {node!r}")
-            return self._justify(node, path=())
+        snapshot = self.store.snapshot()
+        if node not in snapshot["nodes"]:
+            raise NotFound(f"unknown node {node!r}")
+        return self._justify_graph(node, snapshot)
+
+    def _justify_graph(self, root, snapshot) -> dict:
+        facts = snapshot["facts"]
+        all_supports = snapshot["supports"]
+        node_states = snapshot["nodes"]
+
+        supports_by_conclusion: dict = {}
+        for rule_id, support in all_supports.items():
+            supports_by_conclusion.setdefault(
+                support["conclusion"], []
+            ).append(rule_id)
+
+        # Pass 1: collect every node/support reachable from the root, following
+        # supports to their premises.  Each id is visited at most once.
+        reached = set()
+        reached_supports = set()
+        stack = [root]
+        while stack:
+            current = stack.pop()
+            if current in reached:
+                continue
+            reached.add(current)
+            for rule_id in supports_by_conclusion.get(current, []):
+                reached_supports.add(rule_id)
+                stack.extend(all_supports[rule_id]["premises"])
+
+        # Pass 2: strongly connected components (Tarjan) over the reachable
+        # node graph (conclusion -> premise).  An edge whose ends share a
+        # (non-trivial) component is a cycle edge.
+        components = self._support_components(
+            reached, reached_supports, all_supports
+        )
+
+        nodes_out = {}
+        for node_id in sorted(reached):
+            state = node_states[node_id]
+            if state["kind"] == "fact":
+                fact = facts[node_id]
+                nodes_out[node_id] = {
+                    "id": node_id,
+                    "kind": "fact",
+                    "label": fact["label"],
+                    "status": fact["status"],
+                    "valid": fact["status"] == "asserted",
+                }
+                continue
+            support_ids = sorted(
+                sid for sid in supports_by_conclusion.get(node_id, [])
+                if sid in reached_supports
+            )
+            entry = {
+                "id": node_id,
+                "kind": "conclusion",
+                "valid": state["valid"],
+                "support_ids": support_ids,
+                "cyclic": len(components[node_id]) > 1,
+            }
+            nodes_out[node_id] = entry
+
+        supports_out = {}
+        cycles = []
+        for rule_id in sorted(reached_supports):
+            support = all_supports[rule_id]
+            conclusion = support["conclusion"]
+            cyclic_premises = [
+                premise for premise in support["premises"]
+                if components[premise] == components[conclusion]
+                and len(components[conclusion]) > 1
+            ]
+            supports_out[rule_id] = {
+                "rule_id": rule_id,
+                "conclusion": conclusion,
+                "premises": list(support["premises"]),
+                "status": support["status"],
+                "cyclic": bool(cyclic_premises),
+            }
+            for premise in cyclic_premises:
+                cycles.append({
+                    "node": conclusion,
+                    "rule_id": rule_id,
+                    "premise": premise,
+                })
+        cycles.sort(key=lambda item: (item["node"], item["rule_id"],
+                                      item["premise"]))
+
+        return {
+            "format": "shared-graph/v1",
+            "root": root,
+            "nodes": nodes_out,
+            "supports": supports_out,
+            "cycles": cycles,
+        }
+
+    @staticmethod
+    def _support_components(reached, reached_supports, all_supports) -> dict:
+        """Iterative Tarjan SCC over conclusion->premise edges.
+
+        Returns ``node -> component`` where a component is a frozenset of
+        member node ids; a component of size 1 is not a cycle (self-supporting
+        rules are rejected at validation time).
+        """
+        adjacency = {node: [] for node in reached}
+        for rule_id in reached_supports:
+            support = all_supports[rule_id]
+            adjacency[support["conclusion"]].extend(support["premises"])
+
+        indices = {}
+        lowlink = {}
+        next_index = 0
+        dfs_stack = []       # nodes currently in the SCC candidate stack
+        on_stack = set()
+        members_by_component = []
+
+        for root in reached:
+            if root in indices:
+                continue
+            # Work items: (node, iterator position over neighbours)
+            indices[root] = lowlink[root] = next_index
+            next_index += 1
+            dfs_stack.append(root)
+            on_stack.add(root)
+            work = [(root, 0)]
+            while work:
+                v, position = work[-1]
+                neighbours = adjacency[v]
+                if position < len(neighbours):
+                    w = neighbours[position]
+                    work[-1] = (v, position + 1)
+                    if w not in indices:
+                        indices[w] = lowlink[w] = next_index
+                        next_index += 1
+                        dfs_stack.append(w)
+                        on_stack.add(w)
+                        work.append((w, 0))
+                    elif w in on_stack:
+                        lowlink[v] = min(lowlink[v], indices[w])
+                else:
+                    work.pop()
+                    if lowlink[v] == indices[v]:
+                        members = []
+                        while True:
+                            w = dfs_stack.pop()
+                            on_stack.discard(w)
+                            members.append(w)
+                            if w == v:
+                                break
+                        members_by_component.append(frozenset(members))
+                    if work:
+                        parent = work[-1][0]
+                        lowlink[parent] = min(lowlink[parent], lowlink[v])
+
+        component_of = {}
+        for component in members_by_component:
+            for member in component:
+                component_of[member] = component
+        return component_of
+
 
     def health(self) -> dict:
         return {"status": "ok" if self.store.ping() else "degraded"}
@@ -433,25 +602,3 @@ class Engine:
             remaining -= set(wave)
             depth += 1
         return chain
-
-    def _justify(self, node, path) -> dict:
-        kind = self.store.node_kind(node)
-        if kind == "fact":
-            fact = self.store.get_fact(node)
-            return {"node": node, "kind": "fact", "label": fact["label"],
-                    "status": fact["status"],
-                    "valid": fact["status"] == "asserted"}
-        if node in path:
-            return {"node": node, "kind": "conclusion", "cyclic": True,
-                    "valid": self.store.node_valid(node)}
-        supports = []
-        for support in self.store.supports_for_conclusion(node):
-            supports.append({
-                "rule_id": support["rule_id"],
-                "status": support["status"],
-                "premises": [self._justify(p, path + (node,))
-                             for p in support["premises"]],
-            })
-        return {"node": node, "kind": "conclusion",
-                "valid": self.store.node_valid(node),
-                "supports": supports}

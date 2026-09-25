@@ -128,6 +128,10 @@ th { color: var(--muted); font-weight: 600; }
 .fact-leaf.invalid, .fact-leaf.retracted { color: var(--bad); text-decoration: line-through; }
 .fact-leaf.asserted { color: var(--ok); }
 .broken { color: var(--bad); font-weight: 600; }
+.node-ref { color: var(--accent); text-decoration: none; font-weight: 600; }
+.node-ref:hover { text-decoration: underline; }
+.node-ref.cyclic-ref { color: #92400e; }
+li[id^="basis-node-"] { scroll-margin-top: 12px; }
 
 .verdict-block {
   border: 1px solid var(--line);
